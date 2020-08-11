@@ -77,8 +77,8 @@ type Conn struct {
 	dialer         Dialer
 	hostProvider   HostProvider
 	serverMu       sync.Mutex // protects server
-	server         string     // remember the address/port of the current server
-	conn           net.Conn
+	server         string     // remember the address/port of the current server // 当前连接的zk节点
+	conn           net.Conn // tcp连接
 	eventChan      chan Event
 	eventCallback  EventCallback // may be nil
 	shouldQuit     chan struct{}
@@ -192,13 +192,13 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 
 	ec := make(chan Event, eventChanSize)
 	conn := &Conn{
-		dialer:         net.DialTimeout,
+		dialer:         net.DialTimeout, // net包的Dial函数
 		hostProvider:   &DNSHostProvider{},
 		conn:           nil,
 		state:          StateDisconnected,
 		eventChan:      ec,
 		shouldQuit:     make(chan struct{}),
-		connectTimeout: 1 * time.Second,
+		connectTimeout: 1 * time.Second, // 连接超时
 		sendChan:       make(chan *request, sendChanSize),
 		requests:       make(map[int32]*request),
 		watchers:       make(map[watchPathType][]chan Event),
@@ -213,14 +213,14 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		option(conn)
 	}
 
-	if err := conn.hostProvider.Init(srvs); err != nil {
+	if err := conn.hostProvider.Init(srvs); err != nil { // ns lookup
 		return nil, nil, err
 	}
 
 	conn.setTimeouts(int32(sessionTimeout / time.Millisecond))
 
 	go func() {
-		conn.loop()
+		conn.loop() // 建立连接
 		conn.flushRequests(ErrClosing)
 		conn.invalidateWatches(ErrClosing)
 		close(conn.eventChan)
@@ -377,7 +377,7 @@ func (c *Conn) connect() error {
 			}
 		}
 
-		zkConn, err := c.dialer("tcp", c.Server(), c.connectTimeout)
+		zkConn, err := c.dialer("tcp", c.Server(), c.connectTimeout) // net.Dial返回的tcp连接
 		if err == nil {
 			c.conn = zkConn
 			c.setState(StateConnected)
@@ -476,7 +476,7 @@ func (c *Conn) sendRequest(
 
 func (c *Conn) loop() {
 	for {
-		if err := c.connect(); err != nil {
+		if err := c.connect(); err != nil { // 建立连接
 			// c.Close() was called
 			return
 		}
@@ -504,7 +504,7 @@ func (c *Conn) loop() {
 				if c.debugCloseRecvLoop {
 					close(c.debugReauthDone)
 				}
-				err := c.sendLoop()
+				err := c.sendLoop() // 循环发送请求
 				if err != nil || c.logInfo {
 					c.logger.Printf("send loop terminated: err=%v", err)
 				}
@@ -518,7 +518,7 @@ func (c *Conn) loop() {
 				if c.debugCloseRecvLoop {
 					err = errors.New("DEBUG: close recv loop")
 				} else {
-					err = c.recvLoop(c.conn)
+					err = c.recvLoop(c.conn) // 循环接收请求
 				}
 				if err != io.EOF || c.logInfo {
 					c.logger.Printf("recv loop terminated: err=%v", err)
@@ -533,7 +533,7 @@ func (c *Conn) loop() {
 			c.resendZkAuth(reauthChan)
 
 			c.sendSetWatches()
-			wg.Wait()
+			wg.Wait() // 一直阻塞
 		}
 
 		c.setState(StateDisconnected)
@@ -749,7 +749,7 @@ func (c *Conn) authenticate() error {
 	return nil
 }
 
-func (c *Conn) sendData(req *request) error {
+func (c *Conn) sendData(req *request) error { // 发送请求到服务器
 	header := &requestHeader{req.xid, req.opcode}
 	n, err := encodePacket(c.buf[4:], header)
 	if err != nil {
@@ -767,7 +767,7 @@ func (c *Conn) sendData(req *request) error {
 
 	binary.BigEndian.PutUint32(c.buf[:4], uint32(n))
 
-	c.requestsLock.Lock()
+	c.requestsLock.Lock() // 加锁
 	select {
 	case <-c.closeChan:
 		req.recvChan <- response{-1, ErrConnectionClosed}
@@ -778,7 +778,7 @@ func (c *Conn) sendData(req *request) error {
 	c.requests[req.xid] = req
 	c.requestsLock.Unlock()
 
-	if err := c.conn.SetWriteDeadline(time.Now().Add(c.recvTimeout)); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.recvTimeout)); err != nil { // 设置写超时
 		return err
 	}
 	_, err = c.conn.Write(c.buf[:n+4])
@@ -794,13 +794,13 @@ func (c *Conn) sendData(req *request) error {
 	return nil
 }
 
-func (c *Conn) sendLoop() error {
+func (c *Conn) sendLoop() error { // 循环发送请求到服务器
 	pingTicker := time.NewTicker(c.pingInterval)
 	defer pingTicker.Stop()
 
 	for {
 		select {
-		case req := <-c.sendChan:
+		case req := <-c.sendChan: // 发送请求到服务器
 			if err := c.sendData(req); err != nil {
 				return err
 			}
@@ -951,6 +951,7 @@ func (c *Conn) addWatcher(path string, watchType watchType) <-chan Event {
 	return ch
 }
 
+// 返回值是个发送通道
 func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) <-chan response {
 	rq := &request{
 		xid:        c.nextXid(),
@@ -960,10 +961,11 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 		recvChan:   make(chan response, 1),
 		recvFunc:   recvFunc,
 	}
-	c.sendChan <- rq
+	c.sendChan <- rq // sendChan是无缓冲通道，确保顺序发送请求到服务器
 	return rq.recvChan
 }
 
+// 将客户端的操作写入发送独列
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
 	r := <-c.queueRequest(opcode, req, res, recvFunc)
 	return r.zxid, r.err
@@ -1130,15 +1132,16 @@ func (c *Conn) Delete(path string, version int32) error {
 	return err
 }
 
+// 判断节点是否存在，第二个返回值为节点的元数据
 func (c *Conn) Exists(path string) (bool, *Stat, error) {
-	if err := validatePath(path, false); err != nil {
+	if err := validatePath(path, false); err != nil { // 检查节点路径是否正确
 		return false, nil, err
 	}
 
 	res := &existsResponse{}
 	_, err := c.request(opExists, &existsRequest{Path: path, Watch: false}, res, nil)
 	exists := true
-	if err == ErrNoNode {
+	if err == ErrNoNode { // 节点不存在
 		exists = false
 		err = nil
 	}

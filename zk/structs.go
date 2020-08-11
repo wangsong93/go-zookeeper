@@ -31,8 +31,8 @@ type ACL struct {
 type Stat struct {
 	Czxid          int64 // The zxid of the change that caused this znode to be created.
 	Mzxid          int64 // The zxid of the change that last modified this znode.
-	Ctime          int64 // The time in milliseconds from epoch when this znode was created.
-	Mtime          int64 // The time in milliseconds from epoch when this znode was last modified.
+	Ctime          int64 // The time in milliseconds from epoch when this znode was created. // 创建时间
+	Mtime          int64 // The time in milliseconds from epoch when this znode was last modified. // 最后修改时间
 	Version        int32 // The number of changes to the data of this znode.
 	Cversion       int32 // The number of changes to the children of this znode.
 	Aversion       int32 // The number of changes to the ACL of this znode.
@@ -126,7 +126,7 @@ type PathVersionRequest struct {
 
 type pathWatchRequest struct {
 	Path  string
-	Watch bool
+	Watch bool // 请求的最后一个字节表示是否注册watcher，1表示注册，对应true
 }
 
 type pathResponse struct {
@@ -538,7 +538,7 @@ func encodePacketValue(buf []byte, v reflect.Value) (int, error) {
 		}
 	case reflect.Bool:
 		if v.Bool() {
-			buf[n] = 1
+			buf[n] = 1 // 1表示注册watcher
 		} else {
 			buf[n] = 0
 		}
